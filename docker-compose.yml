@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  vectordb:
+    build: .
+    image: mini-vectordb:latest
+    container_name: mini-vectordb
+    ports:
+      - "8000:8000"
+    environment:
+      VDB_DIM: "128"
+      VDB_METRIC: "cosine"
+      VDB_M: "16"
+      VDB_EF_CONSTRUCTION: "200"
+      VDB_EF_SEARCH: "50"
+      VDB_DATA_DIR: "/app/data"
+    volumes:
+      - vdb_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  vdb_data:
