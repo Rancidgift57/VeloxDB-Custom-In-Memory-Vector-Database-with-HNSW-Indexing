@@ -1,0 +1,10 @@
+.pytest_cache
+.venv
+.env
+api/__pycache__
+benchmarks/__pycache__
+benchmarks/results.csv
+core/__pycache__
+filtering/__pycache__
+storage/__pycache__
+tests/__pycache__
