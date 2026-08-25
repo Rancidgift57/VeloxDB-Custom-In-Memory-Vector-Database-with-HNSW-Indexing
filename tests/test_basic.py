@@ -195,6 +195,85 @@ def test_quantized_index_end_to_end():
     assert idx.stats()["tombstoned"] == 0
 
 
+def test_connect_prune_never_drops_edges_under_contention():
+    """Regression test for the optimistic _connect() rewrite: hammer a
+    small-M graph (so pruning triggers constantly) with many concurrent
+    writer threads and assert the graph comes out structurally sound --
+    no neighbor list ever exceeds its m_target, and no neighbor id ever
+    points at a node that doesn't exist (the failure mode a bad CAS retry
+    would produce)."""
+    import threading
+
+    rng = np.random.default_rng(3)
+    idx = HNSWIndex(dim=8, M=4, ef_construction=32, max_elements=3000, seed=3)
+    vectors = rng.normal(size=(600, 8)).astype(np.float32)
+
+    def worker(vs):
+        for v in vs:
+            idx.insert(v)
+
+    threads = [threading.Thread(target=worker, args=(vectors[i::6],)) for i in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(idx) == 600
+    for nid, node in idx.nodes.items():
+        for layer, nbrs in node.neighbors.items():
+            m_target = idx.M0 if layer == 0 else idx.M
+            assert len(nbrs) <= m_target, f"node {nid} layer {layer} has {len(nbrs)} > {m_target}"
+            for nb in nbrs:
+                assert nb in idx.nodes, f"node {nid} points at nonexistent neighbor {nb}"
+
+
+def test_quantizer_margin_reduces_clipping_and_tracks_clip_rate():
+    """fit_quantizer() now pads the fitted range so vectors just outside
+    the fit sample don't immediately clip, and clip_stats()/should_refit()
+    give an observable signal instead of silent precision loss."""
+    from core.quantization import ScalarQuantizer
+
+    sample = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+
+    tight = ScalarQuantizer(dim=2, margin=0.0)
+    tight.fit(sample)
+    padded = ScalarQuantizer(dim=2, margin=0.1)
+    padded.fit(sample)
+
+    slightly_out = np.array([1.05, 1.05], dtype=np.float32)
+    q_tight = tight.encode(slightly_out)
+    q_padded = padded.encode(slightly_out)
+    assert q_tight[0] == 255  # clipped at the boundary with no margin
+    assert q_padded[0] < 255  # margin gave it real headroom, no clip
+
+    far_out = np.array([100.0, 100.0], dtype=np.float32)
+    for _ in range(250):
+        padded.encode(far_out)
+    assert padded.should_refit()  # sustained heavy clipping is flagged
+
+
+def test_sharded_search_degrades_gracefully_on_shard_failure():
+    """A single unreachable/erroring shard should not take down the whole
+    fan-out search -- other shards' results still come back, and the
+    failure is recorded in last_search_errors instead of being silent."""
+    from client.sharded_client import ShardedVectorDBClient
+
+    sc = ShardedVectorDBClient(["http://s0:8000", "http://s1:8000", "http://s2:8000"])
+    sc.shards[0].search = lambda *a, **k: [{"id": 1, "distance": 0.1, "metadata": {}}]
+    sc.shards[1].search = lambda *a, **k: (_ for _ in ()).throw(ConnectionError("down"))
+    sc.shards[2].search = lambda *a, **k: [{"id": 2, "distance": 0.2, "metadata": {}}]
+
+    results = sc.search([0.1] * 4, k=5)
+    assert len(results) == 2
+    assert set(sc.last_search_errors.keys()) == {1}
+
+    # all shards failing must still raise, not return an empty success
+    for s in sc.shards:
+        s.search = lambda *a, **k: (_ for _ in ()).throw(ConnectionError("down"))
+    with pytest.raises(RuntimeError):
+        sc.search([0.1] * 4, k=5)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
