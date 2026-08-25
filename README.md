@@ -1,4 +1,4 @@
-# MiniVectorDB — In-Memory HNSW Vector Database
+# VeloxDB — In-Memory HNSW Vector Database
 
 A from-scratch (no FAISS/Chroma/Pinecone) approximate nearest neighbor
 engine implementing Hierarchical Navigable Small World graphs, built in
