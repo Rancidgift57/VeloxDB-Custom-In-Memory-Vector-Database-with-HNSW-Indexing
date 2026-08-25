@@ -11,7 +11,7 @@ not pseudocode.
 ## 1. Architecture / File Map
 
 ```
-vectordb/
+veloxdb/
 ├── core/
 │   ├── distance.py       # vectorized cosine / euclidean / dot kernels
 │   ├── node.py            # graph node: id, level, per-layer neighbors, tombstone
