@@ -232,16 +232,62 @@ the composite id. Verified against two **real, independently running**
 neighbor first (distance ≈ 0), and delete correctly removes the vector
 from its actual shard.
 
-## 6. Remaining honest caveats (not fully solved, by design)
+## 6. Follow-up fixes to the three remaining caveats
 
-- Per-node locking removes the *single* coarse lock but two concurrent
-  inserts that both want to connect to the *same* popular hub node will
-  still serialize briefly on that node's lock — expected and fine at
-  normal HNSW fan-out (`M`/`M0`), not a bottleneck in practice.
-- Sharded search cost is O(shards) network round-trips fanned out in
-  parallel — latency is roughly `max(shard latencies)`, not `sum`, but it's
-  still more network overhead than a single-process query.
-- `fit_quantizer()` must be called with a representative sample before the
-  first insert; vectors far outside that sample's per-dimension range will
-  clip at encode time. Re-fitting happens automatically during `compact()`
-  (on the live corpus at that point), not continuously.
+These three were previously listed as "not fully solved, by design." They're
+each fundamental tradeoffs of their approach (per-node locking, sharded
+fan-out, sample-based quantization), so none of them is eliminated outright
+— but each had a concrete, addressable gap that's now fixed. Honest
+before/after:
+
+### Hub-node lock hold time — shrunk, not eliminated
+Two concurrent inserts connecting to the same hub node still can't write to
+it *simultaneously* — that's inherent to having a lock at all. But
+previously `_connect()` held that lock for the append **and** the full
+prune (an O(len(neighbors)) distance computation + heuristic sort), so a
+hub's lock was serializing on the expensive part, not just the cheap part.
+`HNSWIndex._connect()` now does the append under the lock, then computes
+the prune *outside* the lock, and only reacquires it to commit — using an
+optimistic compare-and-swap (retry if another writer's edge landed in the
+meantime) rather than holding the lock through the distance math. The lock
+is now held for O(1) list operations; concurrent writers to different hubs
+no longer wait on each other's distance calculations. Verified in
+`tests/test_basic.py::test_connect_prune_never_drops_edges_under_contention`
+— 6 threads inserting into a small-M (frequent-pruning) graph, then
+asserting every neighbor list is within `m_target` and every neighbor id
+still resolves to a real node (the failure mode a buggy retry would cause).
+
+### Sharded search: failure handling, not round-trip count
+The `O(shards)` parallel-fanout network cost is architectural and stays —
+that's the cost of sharding at all. What was actually a gap: one
+unreachable/slow shard made `ShardedVectorDBClient.search()` raise and
+throw away every other shard's perfectly good results — an availability
+bug on top of the expected latency cost. `search()` now takes a
+`shard_timeout` and skips (rather than propagates) an individual shard's
+failure, returning the merged results from whichever shards did respond;
+failures are recorded in `self.last_search_errors` for callers/monitoring
+to inspect, and only raises if *every* shard failed or
+`require_all_shards=True` is passed. Verified in
+`tests/test_basic.py::test_sharded_search_degrades_gracefully_on_shard_failure`.
+
+### Quantizer clipping — wider tolerance + observability, not unbounded
+`fit_quantizer()` still needs *a* representative sample, and a large enough
+distribution shift will still eventually clip — quantization to a fixed
+8-bit range can't fully escape that. Two real improvements:
+`ScalarQuantizer` now pads the fitted min/max by a configurable `margin`
+(10% default) so vectors moderately outside the original sample don't
+immediately hit the boundary, and it tracks a running clip rate
+(`clip_stats()`) with `should_refit()` flagging when clipping has become
+frequent enough that a `compact()` (which re-fits on the live corpus) is
+actually due — instead of drift silently degrading recall with no signal.
+This is surfaced automatically in `HNSWIndex.stats()` / the `/health`
+endpoint under `quantizer` whenever `quantize=True`. Verified in
+`tests/test_basic.py::test_quantizer_margin_reduces_clipping_and_tracks_clip_rate`.
+
+---
+
+## Contact
+ - LinkedIn: https://www.linkedin.com/in/nikhil-nair-809248286/
+ - Email: nnair7598@gmail.com
+
+## Thank You
