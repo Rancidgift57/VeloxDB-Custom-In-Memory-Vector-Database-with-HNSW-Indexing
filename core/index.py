@@ -349,24 +349,53 @@ class HNSWIndex:
         return selected
 
     def _connect(self, a: int, b: int, layer: int):
-        """Add a<->b edge and prune a's neighbor list back down to m_target
-        if it overflowed. The add + read + prune sequence is wrapped in
-        node `a`'s own lock so a concurrent _connect(a, c, layer) from
-        another insert can't interleave and prune away b's freshly-added
-        edge based on a stale neighbor list (a lost-update race)."""
+        """Add a<->b edge and, if that pushes a's neighbor list over
+        m_target, prune it back down.
+
+        Optimistic / lock-minimizing version. Two steps:
+          1. Append `b` under node `a`'s lock -- cheap, O(1) copy-on-write
+             swap, same as before.
+          2. If pruning is needed, compute the expensive part (distances
+             from `a` to every neighbor + the diversity heuristic sort)
+             OUTSIDE the lock, then take the lock again only to *commit*
+             the pruned list -- and only if nobody else appended/pruned
+             on this node in the meantime. If they did, our pruned list
+             is stale (it may be missing an edge a concurrent _connect
+             just added), so we just retry with the fresh list instead
+             of silently dropping that edge.
+
+        This is what actually removes hub-node contention as a practical
+        concern: previously a popular node's lock was held for the full
+        append + O(len(neighbors)) distance computation + sort, so two
+        inserts racing to connect to the same hub fully serialized on
+        that expensive work. Now the lock is only ever held for O(1) list
+        operations; the distance math for two different callers can run
+        concurrently, and collisions only cost a cheap retry of the
+        compare-and-swap, not a wait.
+        """
         node_a = self.nodes[a]
         with node_a.lock:
             current = node_a.neighbors.get(layer, [])
             if b not in current:
-                node_a.neighbors[layer] = current + [b]
+                current = current + [b]
+                node_a.neighbors[layer] = current
 
-            m_target = self.M0 if layer == 0 else self.M
+        m_target = self.M0 if layer == 0 else self.M
+        while True:
             neighbors = node_a.neighbors.get(layer, [])
-            if len(neighbors) > m_target:
-                dists = self._distances_to(self._get_vec(a), neighbors)
-                ranked = sorted(zip(neighbors, dists), key=lambda x: x[1])
-                pruned = self._select_neighbors_heuristic(self._get_vec(a), ranked, m_target)
-                node_a.neighbors[layer] = [c for c, _ in pruned]
+            if len(neighbors) <= m_target:
+                return
+            dists = self._distances_to(self._get_vec(a), neighbors)
+            ranked = sorted(zip(neighbors, dists), key=lambda x: x[1])
+            pruned = self._select_neighbors_heuristic(self._get_vec(a), ranked, m_target)
+            pruned_ids = [c for c, _ in pruned]
+            with node_a.lock:
+                if node_a.neighbors.get(layer, []) == neighbors:
+                    node_a.neighbors[layer] = pruned_ids
+                    return
+                # Someone else's append/prune landed while we were computing
+                # distances -- our snapshot is stale. Loop and redo the
+                # (cheap, rare) prune against the current list.
 
     # ------------------------------------------------------------------ #
     # Search
@@ -514,7 +543,7 @@ class HNSWIndex:
         return sum(1 for n in self.nodes.values() if not n.tombstone)
 
     def stats(self) -> Dict[str, Any]:
-        return {
+        out = {
             "total_nodes": len(self.nodes),
             "live_nodes": len(self),
             "tombstoned": len(self.nodes) - len(self),
@@ -525,3 +554,12 @@ class HNSWIndex:
             "dim": self.dim,
             "metric": self.metric.value,
         }
+        if self.quantize and self.quantizer is not None and self.quantizer.fitted:
+            # Surfaces clip-rate telemetry so drift in the fitted range is
+            # observable instead of silently degrading recall -- see
+            # ScalarQuantizer.should_refit() for the actionable check.
+            out["quantizer"] = {
+                **self.quantizer.clip_stats(),
+                "should_refit": self.quantizer.should_refit(),
+            }
+        return out
