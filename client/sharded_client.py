@@ -50,6 +50,9 @@ class ShardedVectorDBClient:
         self.shards = [VectorDBClient(url, timeout=timeout) for url in base_urls]
         self.n_shards = len(self.shards)
         self._pool = ThreadPoolExecutor(max_workers=max_workers or self.n_shards)
+        # Populated after each search() with {shard_idx: exception} for any
+        # shard that failed/timed out on that call (empty dict if all ok).
+        self.last_search_errors: Dict[int, Exception] = {}
 
     def _shard_for_key(self, key: str) -> int:
         # Deterministic hash -> shard index (consistent for a given key, so
@@ -95,26 +98,67 @@ class ShardedVectorDBClient:
         k: int = 10,
         ef_search: Optional[int] = None,
         filter: Optional[Dict[str, Any]] = None,
+        shard_timeout: Optional[float] = None,
+        require_all_shards: bool = False,
     ) -> List[Dict[str, Any]]:
         """Fan out to every shard in parallel (each shard independently
         returns its own local top-k), then merge by distance and take the
         global top-k. Correctness note: this assumes all shards share the
         same metric/embedding space, so distances are directly comparable
-        -- true as long as every shard was configured identically."""
+        -- true as long as every shard was configured identically.
+
+        Previously a single slow/unreachable shard made the *whole*
+        search raise, even though N-1 other shards had perfectly good
+        results sitting in hand -- an availability bug, not just a perf
+        one. Now:
+          - `shard_timeout` (seconds) bounds how long we wait on each
+            individual shard's future, independent of the per-request
+            HTTP timeout baked into that shard's client. Defaults to the
+            client's own timeout if not given.
+          - A shard that errors or times out is skipped (its results
+            just don't contribute to the merge) rather than blowing up
+            the whole call, UNLESS `require_all_shards=True`, in which
+            case any shard failure raises -- for callers who need a
+            recall guarantee over an availability one.
+          - `self.last_search_errors` is populated with {shard_idx: exc}
+            for any shard that failed, so callers who want to know can
+            check it after the call instead of it being silent.
+        """
         futures = {
             self._pool.submit(shard.search, vector, k, ef_search, filter): idx
             for idx, shard in enumerate(self.shards)
         }
         merged: List[Dict[str, Any]] = []
-        for future in as_completed(futures):
-            shard_idx = futures[future]
-            hits = future.result()
-            for hit in hits:
-                merged.append({
-                    "id": _composite_id(shard_idx, hit["id"]),
-                    "distance": hit["distance"],
-                    "metadata": hit["metadata"],
-                })
+        errors: Dict[int, Exception] = {}
+        timeout = shard_timeout if shard_timeout is not None else self.shards[0].timeout
+        try:
+            for future in as_completed(futures, timeout=timeout):
+                shard_idx = futures[future]
+                try:
+                    hits = future.result()
+                except Exception as e:  # noqa: BLE001
+                    errors[shard_idx] = e
+                    continue
+                for hit in hits:
+                    merged.append({
+                        "id": _composite_id(shard_idx, hit["id"]),
+                        "distance": hit["distance"],
+                        "metadata": hit["metadata"],
+                    })
+        except TimeoutError:
+            # Some futures never completed within shard_timeout -- record
+            # them as errors too instead of hanging or silently dropping.
+            for future, shard_idx in futures.items():
+                if not future.done():
+                    errors[shard_idx] = TimeoutError(f"shard {shard_idx} exceeded {timeout}s")
+
+        self.last_search_errors = errors
+        if errors and (require_all_shards or len(errors) == self.n_shards):
+            raise RuntimeError(
+                f"search failed on shard(s) {sorted(errors)}: "
+                f"{ {i: str(e) for i, e in errors.items()} }"
+            )
+
         merged.sort(key=lambda h: h["distance"])
         return merged[:k]
 
