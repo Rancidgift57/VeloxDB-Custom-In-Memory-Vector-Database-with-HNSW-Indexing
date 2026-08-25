@@ -232,14 +232,6 @@ the composite id. Verified against two **real, independently running**
 neighbor first (distance ≈ 0), and delete correctly removes the vector
 from its actual shard.
 
-## 6. Follow-up fixes to the three remaining caveats
-
-These three were previously listed as "not fully solved, by design." They're
-each fundamental tradeoffs of their approach (per-node locking, sharded
-fan-out, sample-based quantization), so none of them is eliminated outright
-— but each had a concrete, addressable gap that's now fixed. Honest
-before/after:
-
 ### Hub-node lock hold time — shrunk, not eliminated
 Two concurrent inserts connecting to the same hub node still can't write to
 it *simultaneously* — that's inherent to having a lock at all. But
