@@ -282,4 +282,4 @@ endpoint under `quantizer` whenever `quantize=True`. Verified in
  - LinkedIn: https://www.linkedin.com/in/nikhil-nair-809248286/
  - Email: nnair7598@gmail.com
 
-## Thank You
+## Thank You  
